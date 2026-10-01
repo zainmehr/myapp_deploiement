@@ -57,7 +57,7 @@ jobs:
         run: docker run -d --name e2e-app -p 8080:8080 ${{ env.IMAGE_NAME }}:test
 
       - name: Wait for healthcheck
-        run: curl --retry 15 --retry-connrefused --retry-delay 2 -fsS http://localhost:8080/health
+        run: curl --retry 15 --retry-all-errors --retry-delay 2 -fsS http://localhost:8080/health
 
       - name: Run E2E tests
         env:
@@ -126,5 +126,5 @@ jobs:
 
       - name: Verify deployment (healthcheck)
         run: |
-          curl --retry 15 --retry-connrefused --retry-delay 3 -fsS http://${{ secrets.VM_HOST }}:${{ env.HOST_PORT }}/health
+          curl --retry 15 --retry-all-errors --retry-delay 3 -fsS http://${{ secrets.VM_HOST }}:${{ env.HOST_PORT }}/health
           curl -fsS http://${{ secrets.VM_HOST }}:${{ env.HOST_PORT }}/who
