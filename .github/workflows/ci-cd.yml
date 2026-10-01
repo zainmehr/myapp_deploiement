@@ -1,0 +1,130 @@
+name: CI/CD - Test, build, push et deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: myapp
+  CONTAINER_NAME: myapp-zainmehr   
+  HOST_PORT: 8026                # port attribué sur la VM
+
+jobs:
+  # ---------- Job 1 : tests unitaires ----------
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m pytest tests/unit
+
+  # ---------- Job 2 : tests E2E contre le conteneur ----------
+  e2e-tests:
+    name: E2E tests
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build image for testing
+        run: docker build -t ${{ env.IMAGE_NAME }}:test .
+
+      - name: Start container
+        run: docker run -d --name e2e-app -p 8080:8080 ${{ env.IMAGE_NAME }}:test
+
+      - name: Wait for healthcheck
+        run: curl --retry 15 --retry-connrefused --retry-delay 2 -fsS http://localhost:8080/health
+
+      - name: Run E2E tests
+        env:
+          BASE_URL: http://localhost:8080
+        run: python -m pytest tests/e2e
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs e2e-app
+
+  # ---------- Job 3 : build & push Docker Hub ----------
+  build-and-push:
+    name: Build and push Docker image
+    needs: [unit-tests, e2e-tests]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push (latest + commit SHA)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  # ---------- Job 4 : déploiement sur la VM Azure ----------
+  deploy:
+    name: Deploy on Azure VM
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Pull and restart container (idempotent)
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          NAME: ${{ env.CONTAINER_NAME }}
+          PORT: ${{ env.HOST_PORT }}
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} \
+            "IMAGE=$IMAGE NAME=$NAME PORT=$PORT bash -s" << 'EOF'
+          set -e
+          docker pull "$IMAGE"
+          docker rm -f "$NAME" 2>/dev/null || true
+          docker run -d --name "$NAME" --restart unless-stopped -p "$PORT":8080 "$IMAGE"
+          EOF
+
+      - name: Verify deployment (healthcheck)
+        run: |
+          curl --retry 15 --retry-connrefused --retry-delay 3 -fsS http://${{ secrets.VM_HOST }}:${{ env.HOST_PORT }}/health
+          curl -fsS http://${{ secrets.VM_HOST }}:${{ env.HOST_PORT }}/who
